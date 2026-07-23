@@ -155,6 +155,41 @@ contract LendingEngine is ReentrancyGuard {
         bool success = IERC20(asset).transferFrom(msg.sender, address(this), amount);
         require(success, "LendingEngine: Repay transfer failed");
     }
+    function liquidate(
+        address borrower,
+        address collateralAsset,
+        address debtAsset,
+        uint256 debtToCover
+    ) external nonReentrant {
+        // 1. Verify borrower is actually undercollateralized
+        uint256 startingHealthFactor = _getHealthFactor(borrower);
+        require(startingHealthFactor < MIN_HEALTH_FACTOR, "LendingEngine: Health factor is safe!");
+
+        // 2. Reduce debt balance
+        require(s_borrowedBalances[borrower][debtAsset] >= debtToCover, "LendingEngine: Debt to cover exceeds balance");
+        s_borrowedBalances[borrower][debtAsset] -= debtToCover;
+
+        // 3. Calculate collateral amount to seize (including liquidation bonus)
+        uint256 debtValueUsd = getUsdValue(debtAsset, debtToCover);
+        uint256 collateralPrice = i_oracle.getPrice(collateralAsset);
+        uint8 collateralDecimals = IERC20Metadata(collateralAsset).decimals();
+        uint256 bonus = s_assetConfigs[collateralAsset].liquidationBonus;
+
+        uint256 collateralToSeize = (debtValueUsd * (10 ** collateralDecimals) * bonus) 
+            / (collateralPrice * 10 ** 10 * PERCENTAGE_FACTOR);
+
+        require(s_collateralDeposits[borrower][collateralAsset] >= collateralToSeize, "LendingEngine: Insufficient collateral");
+        s_collateralDeposits[borrower][collateralAsset] -= collateralToSeize;
+
+        emit Liquidated(borrower, msg.sender, collateralAsset, debtAsset, debtToCover, collateralToSeize);
+
+        // 4. Transfer tokens
+        bool debtSuccess = IERC20(debtAsset).transferFrom(msg.sender, address(this), debtToCover);
+        require(debtSuccess, "LendingEngine: Debt transfer failed");
+
+        bool collateralSuccess = IERC20(collateralAsset).transfer(msg.sender, collateralToSeize);
+        require(collateralSuccess, "LendingEngine: Collateral transfer failed");
+    }
 
     // ------------------------------------------------------------------------
     // Calculations & Health Factor Engine
