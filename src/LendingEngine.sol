@@ -4,238 +4,206 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "./mocks/MockOracle.sol";
 
-/**
- * @title LendingEngine
- * @notice Core contract managing multi-asset collateral, liquidity pools, borrowing, and liquidations.
- */
+interface IMockOracle {
+    function getPrice(address asset) external view returns (uint256);
+}
+
 contract LendingEngine is ReentrancyGuard {
-    // ------------------------------------------------------------------------
-    // Structs & State Variables
-    // ------------------------------------------------------------------------
+    error LendingEngine__NeedsMoreThanZero();
+    error LendingEngine__TokenNotSupported();
+    error LendingEngine__NotAllowedAsCollateral();
+    error LendingEngine__BreaksHealthFactor(uint256 healthFactor);
+    error LendingEngine__HealthFactorOk();
+    error LendingEngine__TransferFailed();
 
     struct AssetConfig {
-        bool isAllowedCollateral;
-        bool isAllowedBorrow;
-        uint256 ltv;                  // e.g. 7500 = 75%
-        uint256 liquidationThreshold; // e.g. 8000 = 80%
-        uint256 liquidationBonus;     // e.g. 10500 = 105% (5% bonus)
+        bool isSupported;
+        bool isCollateral;
+        bool isBorrowable;
+        uint256 ltv;                  // Basis points (e.g., 8000 = 80%)
+        uint256 liquidationThreshold; // Basis points (e.g., 8500 = 85%)
+        uint256 liquidationBonus;     // Basis points (e.g., 500 = 5%)
+        uint256 baseRate;             // Base APY (e.g., 200 = 2%)
+        uint256 slope1;               // APY slope before kink (e.g., 400 = 4%)
+        uint256 slope2;               // APY slope after kink (e.g., 6000 = 60%)
+        uint256 optimalUtilization;   // Kink utilization (e.g., 8000 = 80%)
     }
 
-    uint256 public constant PERCENTAGE_FACTOR = 10000; // 100% = 10000
-    uint256 public constant MIN_HEALTH_FACTOR = 1e18;  // 1.0 in 18-decimal precision
-
-    MockOracle public immutable i_oracle;
-
-    // Track allowed assets
-    address[] public s_allowedAssets;
+    // Mappings
     mapping(address => AssetConfig) public s_assetConfigs;
+    address[] public s_allowedAssets;
 
-    // User Balances
-    // user => token => collateral amount
-    mapping(address => mapping(address => uint256)) public s_collateralDeposits;
-    // user => token => liquidity supplied amount
-    mapping(address => mapping(address => uint256)) public s_liquidityDeposits;
-    // user => token => borrowed amount
-    mapping(address => mapping(address => uint256)) public s_borrowedBalances;
+    mapping(address => mapping(address => uint256)) public s_collateralDeposits; // user => asset => amount
+    mapping(address => mapping(address => uint256)) public s_liquiditySupplied;  // user => asset => amount
+    mapping(address => mapping(address => uint256)) public s_borrowedBalances;   // user => asset => amount
+    mapping(address => uint256) public s_totalBorrowed;                          // asset => amount
+    mapping(address => uint256) public s_totalSupplied;                          // asset => amount
 
-    // ------------------------------------------------------------------------
-    // Events
-    // ------------------------------------------------------------------------
+    IMockOracle public immutable i_oracle;
+    uint256 private constant PRECISION = 1e18;
+    uint256 private constant BPS_PRECISION = 10000;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
 
-    event AssetConfigured(address indexed asset, bool isCollateral, bool isBorrow);
     event CollateralDeposited(address indexed user, address indexed asset, uint256 amount);
-    event CollateralWithdrawn(address indexed user, address indexed asset, uint256 amount);
     event LiquiditySupplied(address indexed user, address indexed asset, uint256 amount);
-    event LiquidityWithdrawn(address indexed user, address indexed asset, uint256 amount);
     event Borrowed(address indexed user, address indexed asset, uint256 amount);
     event Repaid(address indexed user, address indexed asset, uint256 amount);
-    event Liquidated(
-        address indexed borrower,
-        address indexed liquidator,
-        address collateralAsset,
-        address debtAsset,
-        uint256 debtToCover,
-        uint256 collateralSeized
-    );
+    event Liquidated(address indexed borrower, address indexed collateral, address indexed debt, uint256 debtToCover);
 
-    // ------------------------------------------------------------------------
-    // Modifiers & Constructor
-    // ------------------------------------------------------------------------
-
-    constructor(address oracleAddress) {
-        require(oracleAddress != address(0), "LendingEngine: Zero address oracle");
-        i_oracle = MockOracle(oracleAddress);
+    modifier moreThanZero(uint256 amount) {
+        if (amount == 0) revert LendingEngine__NeedsMoreThanZero();
+        _;
     }
 
-    // ------------------------------------------------------------------------
-    // Admin / Configuration
-    // ------------------------------------------------------------------------
+    modifier isSupported(address asset) {
+        if (!s_assetConfigs[asset].isSupported) revert LendingEngine__TokenNotSupported();
+        _;
+    }
+
+    constructor(address oracleAddress) {
+        i_oracle = IMockOracle(oracleAddress);
+    }
 
     function configureAsset(
         address asset,
         bool isCollateral,
-        bool isBorrow,
+        bool isBorrowable,
         uint256 ltv,
         uint256 liquidationThreshold,
-        uint256 liquidationBonus
+        uint256 liquidationBonus,
+        uint256 baseRate,
+        uint256 slope1,
+        uint256 slope2,
+        uint256 optimalUtilization
     ) external {
-        require(asset != address(0), "LendingEngine: Zero address asset");
-        require(ltv < liquidationThreshold, "LendingEngine: LTV must be < threshold");
-
+        if (!s_assetConfigs[asset].isSupported) {
+            s_allowedAssets.push(asset);
+        }
         s_assetConfigs[asset] = AssetConfig({
-            isAllowedCollateral: isCollateral,
-            isAllowedBorrow: isBorrow,
+            isSupported: true,
+            isCollateral: isCollateral,
+            isBorrowable: isBorrowable,
             ltv: ltv,
             liquidationThreshold: liquidationThreshold,
-            liquidationBonus: liquidationBonus
+            liquidationBonus: liquidationBonus,
+            baseRate: baseRate,
+            slope1: slope1,
+            slope2: slope2,
+            optimalUtilization: optimalUtilization
         });
-
-        s_allowedAssets.push(asset);
-        emit AssetConfigured(asset, isCollateral, isBorrow);
     }
 
-    // ------------------------------------------------------------------------
-    // Core User Actions: Collateral & Liquidity
-    // ------------------------------------------------------------------------
+    // --- Core Protocol Actions ---
 
-    function depositCollateral(address asset, uint256 amount) external nonReentrant {
-        require(s_assetConfigs[asset].isAllowedCollateral, "LendingEngine: Not allowed collateral");
-        require(amount > 0, "LendingEngine: Amount must be > 0");
-
+    function depositCollateral(address asset, uint256 amount) external moreThanZero(amount) isSupported(asset) nonReentrant {
+        if (!s_assetConfigs[asset].isCollateral) revert LendingEngine__NotAllowedAsCollateral();
         s_collateralDeposits[msg.sender][asset] += amount;
         emit CollateralDeposited(msg.sender, asset, amount);
-
+        
         bool success = IERC20(asset).transferFrom(msg.sender, address(this), amount);
-        require(success, "LendingEngine: Transfer failed");
+        if (!success) revert LendingEngine__TransferFailed();
     }
 
-    function supplyLiquidity(address asset, uint256 amount) external nonReentrant {
-        require(s_assetConfigs[asset].isAllowedBorrow, "LendingEngine: Asset not borrowable");
-        require(amount > 0, "LendingEngine: Amount must be > 0");
-
-        s_liquidityDeposits[msg.sender][asset] += amount;
+    function supplyLiquidity(address asset, uint256 amount) external moreThanZero(amount) isSupported(asset) nonReentrant {
+        s_liquiditySupplied[msg.sender][asset] += amount;
+        s_totalSupplied[asset] += amount;
         emit LiquiditySupplied(msg.sender, asset, amount);
 
         bool success = IERC20(asset).transferFrom(msg.sender, address(this), amount);
-        require(success, "LendingEngine: Transfer failed");
+        if (!success) revert LendingEngine__TransferFailed();
     }
 
-    // ------------------------------------------------------------------------
-    // Core User Actions: Borrowing & Repayments
-    // ------------------------------------------------------------------------
-
-    function borrow(address asset, uint256 amount) external nonReentrant {
-        require(s_assetConfigs[asset].isAllowedBorrow, "LendingEngine: Asset not borrowable");
-        require(amount > 0, "LendingEngine: Amount must be > 0");
-        require(
-            IERC20(asset).balanceOf(address(this)) >= amount,
-            "LendingEngine: Insufficient pool liquidity"
-        );
-
+    function borrow(address asset, uint256 amount) external moreThanZero(amount) isSupported(asset) nonReentrant {
+        require(s_assetConfigs[asset].isBorrowable, "Asset not borrowable");
+        
         s_borrowedBalances[msg.sender][asset] += amount;
+        s_totalBorrowed[asset] += amount;
 
-        // Health Factor check after borrow calculation
-        require(_getHealthFactor(msg.sender) >= MIN_HEALTH_FACTOR, "LendingEngine: Health factor too low!");
-
+        _revertIfHealthFactorIsBroken(msg.sender);
         emit Borrowed(msg.sender, asset, amount);
 
         bool success = IERC20(asset).transfer(msg.sender, amount);
-        require(success, "LendingEngine: Borrow transfer failed");
+        if (!success) revert LendingEngine__TransferFailed();
     }
 
-    function repay(address asset, uint256 amount) external nonReentrant {
-        require(amount > 0, "LendingEngine: Amount must be > 0");
-        require(s_borrowedBalances[msg.sender][asset] >= amount, "LendingEngine: Repaying more than debt");
+    function repay(address asset, uint256 amount) external moreThanZero(amount) isSupported(asset) nonReentrant {
+        uint256 currentDebt = s_borrowedBalances[msg.sender][asset];
+        uint256 repayAmount = amount > currentDebt ? currentDebt : amount;
 
-        s_borrowedBalances[msg.sender][asset] -= amount;
-        emit Repaid(msg.sender, asset, amount);
+        s_borrowedBalances[msg.sender][asset] -= repayAmount;
+        s_totalBorrowed[asset] -= repayAmount;
 
-        bool success = IERC20(asset).transferFrom(msg.sender, address(this), amount);
-        require(success, "LendingEngine: Repay transfer failed");
-    }
-    function liquidate(
-        address borrower,
-        address collateralAsset,
-        address debtAsset,
-        uint256 debtToCover
-    ) external nonReentrant {
-        // 1. Verify borrower is actually undercollateralized
-        uint256 startingHealthFactor = _getHealthFactor(borrower);
-        require(startingHealthFactor < MIN_HEALTH_FACTOR, "LendingEngine: Health factor is safe!");
+        emit Repaid(msg.sender, asset, repayAmount);
 
-        // 2. Reduce debt balance
-        require(s_borrowedBalances[borrower][debtAsset] >= debtToCover, "LendingEngine: Debt to cover exceeds balance");
-        s_borrowedBalances[borrower][debtAsset] -= debtToCover;
-
-        // 3. Calculate collateral amount to seize (including liquidation bonus)
-        uint256 debtValueUsd = getUsdValue(debtAsset, debtToCover);
-        uint256 collateralPrice = i_oracle.getPrice(collateralAsset);
-        uint8 collateralDecimals = IERC20Metadata(collateralAsset).decimals();
-        uint256 bonus = s_assetConfigs[collateralAsset].liquidationBonus;
-
-        uint256 collateralToSeize = (debtValueUsd * (10 ** collateralDecimals) * bonus) 
-            / (collateralPrice * 10 ** 10 * PERCENTAGE_FACTOR);
-
-        require(s_collateralDeposits[borrower][collateralAsset] >= collateralToSeize, "LendingEngine: Insufficient collateral");
-        s_collateralDeposits[borrower][collateralAsset] -= collateralToSeize;
-
-        emit Liquidated(borrower, msg.sender, collateralAsset, debtAsset, debtToCover, collateralToSeize);
-
-        // 4. Transfer tokens
-        bool debtSuccess = IERC20(debtAsset).transferFrom(msg.sender, address(this), debtToCover);
-        require(debtSuccess, "LendingEngine: Debt transfer failed");
-
-        bool collateralSuccess = IERC20(collateralAsset).transfer(msg.sender, collateralToSeize);
-        require(collateralSuccess, "LendingEngine: Collateral transfer failed");
+        bool success = IERC20(asset).transferFrom(msg.sender, address(this), repayAmount);
+        if (!success) revert LendingEngine__TransferFailed();
     }
 
-    // ------------------------------------------------------------------------
-    // Calculations & Health Factor Engine
-    // ------------------------------------------------------------------------
+    // --- Dynamic Interest Rate Math ---
 
-    function getHealthFactor(address user) external view returns (uint256) {
-        return _getHealthFactor(user);
+    function getUtilizationRate(address asset) public view returns (uint256) {
+        uint256 totalCash = s_totalSupplied[asset];
+        uint256 totalBorrows = s_totalBorrowed[asset];
+        if (totalCash + totalBorrows == 0) return 0;
+        return (totalBorrows * BPS_PRECISION) / (totalCash + totalBorrows);
     }
 
-    function _getHealthFactor(address user) internal view returns (uint256) {
-        (uint256 totalCollateralValueUsd, uint256 totalBorrowedValueUsd) = getUserAccountData(user);
+    function getBorrowRates(address asset) public view returns (uint256 borrowRateBps, uint256 supplyRateBps) {
+        AssetConfig memory config = s_assetConfigs[asset];
+        uint256 utilization = getUtilizationRate(asset);
 
-        if (totalBorrowedValueUsd == 0) return type(uint256).max; // Infinite health factor if no borrow
+        if (utilization <= config.optimalUtilization) {
+            borrowRateBps = config.baseRate + ((utilization * config.slope1) / config.optimalUtilization);
+        } else {
+            uint256 excessUtilization = utilization - config.optimalUtilization;
+            uint256 maxExcess = BPS_PRECISION - config.optimalUtilization;
+            borrowRateBps = config.baseRate + config.slope1 + ((excessUtilization * config.slope2) / maxExcess);
+        }
 
-        return (totalCollateralValueUsd * 1e18) / totalBorrowedValueUsd;
+        supplyRateBps = (borrowRateBps * utilization) / BPS_PRECISION;
     }
 
-    function getUserAccountData(address user)
-        public
-        view
-        returns (uint256 totalCollateralAdjustedUsd, uint256 totalBorrowedValueUsd)
-    {
+    // --- Health Factor & Valuation Math ---
+
+    function getAccountInformation(address user) public view returns (uint256 totalCollateralValueUsd, uint256 totalBorrowValueUsd, uint256 maxBorrowCapacityUsd) {
         for (uint256 i = 0; i < s_allowedAssets.length; i++) {
             address asset = s_allowedAssets[i];
+            AssetConfig memory config = s_assetConfigs[asset];
+            uint256 price = i_oracle.getPrice(asset); // 8 decimals USD
+            uint8 decimals = IERC20Metadata(asset).decimals();
 
-            // 1. Collateral Value
-            uint256 collateralAmount = s_collateralDeposits[user][asset];
-            if (collateralAmount > 0) {
-                uint256 assetValueUsd = getUsdValue(asset, collateralAmount);
-                uint256 threshold = s_assetConfigs[asset].liquidationThreshold;
-                totalCollateralAdjustedUsd += (assetValueUsd * threshold) / PERCENTAGE_FACTOR;
+            // 1. Calculate Collateral
+            uint256 deposited = s_collateralDeposits[user][asset];
+            if (deposited > 0) {
+                uint256 valueUsd = (deposited * price * PRECISION) / (10**decimals * 1e8);
+                totalCollateralValueUsd += valueUsd;
+                maxBorrowCapacityUsd += (valueUsd * config.liquidationThreshold) / BPS_PRECISION;
             }
 
-            // 2. Borrow Value
-            uint256 borrowAmount = s_borrowedBalances[user][asset];
-            if (borrowAmount > 0) {
-                totalBorrowedValueUsd += getUsdValue(asset, borrowAmount);
+            // 2. Calculate Debt
+            uint256 borrowed = s_borrowedBalances[user][asset];
+            if (borrowed > 0) {
+                uint256 debtValueUsd = (borrowed * price * PRECISION) / (10**decimals * 1e8);
+                totalBorrowValueUsd += debtValueUsd;
             }
         }
     }
 
-    function getUsdValue(address asset, uint256 amount) public view returns (uint256) {
-        uint256 price = i_oracle.getPrice(asset);
-        uint8 decimals = IERC20Metadata(asset).decimals();
+    function getHealthFactor(address user) public view returns (uint256) {
+        (uint256 totalCollateralValueUsd, uint256 totalBorrowValueUsd, uint256 maxBorrowCapacityUsd) = getAccountInformation(user);
+        if (totalBorrowValueUsd == 0) return type(uint256).max;
+        return (maxBorrowCapacityUsd * PRECISION) / totalBorrowValueUsd;
+    }
 
-        // Standardize output to 18 decimals
-        return (amount * price * 10 ** 10) / (10 ** decimals);
+    function _revertIfHealthFactorIsBroken(address user) internal view {
+        uint256 userHealthFactor = getHealthFactor(user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert LendingEngine__BreaksHealthFactor(userHealthFactor);
+        }
+    }
+
+    function getAllowedAssets() external view returns (address[] memory) {
+        return s_allowedAssets;
     }
 }
