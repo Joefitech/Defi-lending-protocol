@@ -46,27 +46,6 @@ The protocol features dynamic interest rate models driven by pool utilization, r
 +------------------------+                       +------------------------+
 
 
-Tech Stack
-Smart Contracts (Backend)
-Solidity (^0.8.20) – Core smart contract logic.
-
-Foundry / Forge – Smart contract compilation, testing, and deployment scripting.
-
-Anvil – Local Ethereum node environment.
-
-OpenZeppelin – Security standards (IERC20, SafeERC20, ReentrancyGuard).
-
-
-Frontend & Web3 Integration
-React – Component-driven UI development.
-
-Viem – Modular, high-performance TypeScript interface for EVM contracts (parseAbi, contract client).
-
-Wagmi – React Hooks for wallet connection handling.
-
-Tailwind CSS – Styling and responsive dark-mode DeFi UI.
-
-Supported Asset MarketsAssetNameDecimalsRoleOracle Price (USD)WETHWrapped Ether18Collateral$3,000.00WBTCWrapped Bitcoin8Collateral$65,000.00LINKChainlink18Collateral$18.00UNIUniswap18Collateral$8.00USDCUSD Coin6Collateral$1.00USDTTether USD6Collateral$1.00DAIDai Stablecoin18Collateral$1.00FRAXFrax18Borrow Only
 
 Local Development Setup
 Prerequisites
